@@ -19,6 +19,7 @@ from openviking.core.context import (
 from openviking.core.namespace import (
     classify_uri,
     context_type_for_uri,
+    is_session_uri,
     owner_space_for_uri,
 )
 from openviking.server.dependencies import get_service
@@ -71,6 +72,7 @@ def _is_not_ready_sentinel(text: str, suffix: str) -> bool:
         return False
     head = head[: -len(suffix)].strip()
     return head.startswith("#") and "\n" not in head
+
 
 _reindex_executor: "ReindexExecutor | None" = None
 
@@ -182,6 +184,12 @@ class ReindexExecutor:
         parts = classification.parts
         if not parts:
             return "global_namespace"
+        if is_session_uri(uri):
+            raise OpenVikingError(
+                f"Unsupported reindex URI: {uri}",
+                code="UNSUPPORTED_URI",
+                details={"uri": uri},
+            )
         if parts == ("user",):
             return "user_namespace"
         if classification.is_user_namespace_root:
@@ -531,12 +539,14 @@ class ReindexExecutor:
         counters = run.counters
         ctx = run.ctx
         if mode == "semantic_and_vectors":
-            await self._run_semantic_processor(
-                uri=uri,
-                context_type="memory",
-                ctx=ctx,
-                lock=run.lock,
-            )
+            stat = await get_viking_fs().stat(uri, ctx=ctx)
+            if stat.get("isDir", stat.get("is_dir")):
+                await self._run_semantic_processor(
+                    uri=uri,
+                    context_type="memory",
+                    ctx=ctx,
+                    lock=run.lock,
+                )
             await self._reindex_memory_vectors(uri=uri, counters=counters, ctx=ctx)
             return
         await self._reindex_memory_vectors(uri=uri, counters=counters, ctx=ctx)
@@ -557,7 +567,7 @@ class ReindexExecutor:
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
             peer_id=ctx.user.user_id,
-            role=ctx.role.value,
+            role=str(ctx.role),
             skip_vectorization=True,
         )
         await processor.on_dequeue({"data": msg.to_json()}, lock=lock.as_borrowed())
@@ -740,6 +750,8 @@ class ReindexExecutor:
             entry_uri = entry.get("uri")
             if not entry_uri:
                 continue
+            if is_session_uri(entry_uri):
+                continue
             classification = classify_uri(entry_uri)
             if classification.is_memory:
                 if entry.get("isDir") and classification.is_memory_root:
@@ -826,7 +838,7 @@ class ReindexExecutor:
                 if entry.get("isDir") and remainder and "/" not in remainder:
                     user_roots.append(entry_uri)
                 continue
-            if entry_uri == "viking://session" or entry_uri.startswith("viking://session/"):
+            if is_session_uri(entry_uri):
                 continue
             if not self._is_global_resource_entry(entry_uri):
                 continue
@@ -1237,6 +1249,14 @@ class ReindexExecutor:
     ) -> None:
         service = get_service()
         assert service.vikingdb_manager is not None
+        merged_meta = dict(meta or {})
+        existing = await self._fetch_existing_record(uri=uri, level=int(level), ctx=ctx)
+        if (
+            existing
+            and existing.get("search_tags") is not None
+            and "search_tags" not in merged_meta
+        ):
+            merged_meta["search_tags"] = existing.get("search_tags")
 
         context = Context(
             uri=uri,
@@ -1248,7 +1268,7 @@ class ReindexExecutor:
             user=ctx.user,
             account_id=ctx.account_id,
             owner_space=owner_space_for_uri(uri, ctx),
-            meta=meta or {},
+            meta=merged_meta,
         )
         context.set_vectorize(Vectorize(text=vector_text))
         msg = EmbeddingMsgConverter.from_context(context)

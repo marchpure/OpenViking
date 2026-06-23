@@ -3,6 +3,7 @@
 import httpx
 import pytest
 
+from openviking.core.context import ContextLevel
 from openviking.server.identity import RequestContext, Role
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.session.user_id import UserIdentifier
@@ -47,16 +48,22 @@ async def test_reindex_rejects_unsupported_uri(admin_client: httpx.AsyncClient):
     assert body["error"]["code"] == "UNSUPPORTED_URI"
 
 
-async def test_reindex_rejects_session_uri(admin_client: httpx.AsyncClient):
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "viking://session/test/demo",
+        "viking://user/default/sessions/test/demo",
+    ],
+)
+async def test_reindex_rejects_session_uri(admin_client: httpx.AsyncClient, uri: str):
     resp = await admin_client.post(
         "/api/v1/content/reindex",
-        json={"uri": "viking://session/test/demo", "mode": "vectors_only"},
+        json={"uri": uri, "mode": "vectors_only"},
         headers=ROOT_ACCOUNT_HEADERS,
     )
-    assert resp.status_code == 400
+    assert resp.status_code == 403
     body = resp.json()
     assert body["status"] == "error"
-    assert body["error"]["code"] == "UNSUPPORTED_URI"
 
 
 async def test_reindex_rejects_reason_field(admin_client: httpx.AsyncClient):
@@ -179,8 +186,13 @@ async def test_reindex_memory_semantic_and_vectors_rebuilds_full_subtree(monkeyp
     async def fake_reindex_memory_vectors(self, *, uri, counters, ctx):
         seen["vectors"].append(uri)
 
+    class FakeVikingFS:
+        async def stat(self, uri, ctx=None):
+            return {"isDir": True}
+
     monkeypatch.setattr(ReindexExecutor, "_run_semantic_processor", fake_run_semantic_processor)
     monkeypatch.setattr(ReindexExecutor, "_reindex_memory_vectors", fake_reindex_memory_vectors)
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
 
     service = ReindexExecutor()
     counters = _ReindexCounters()
@@ -597,6 +609,65 @@ async def test_reindex_fetch_existing_record_uses_get_context_by_uri(monkeypatch
     assert record["abstract"] == "from-lookup"
     assert not fake_service.vikingdb_manager.fetch_calls
     assert fake_service.vikingdb_manager.lookup_calls
+
+
+@pytest.mark.asyncio
+async def test_reindex_upsert_context_preserves_existing_search_tags(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor
+
+    captured = {}
+
+    class FakeVikingDB:
+        async def get_context_by_uri(self, uri, owner_space=None, level=None, limit=1, *, ctx=None):
+            del owner_space, limit, ctx
+            return [
+                {
+                    "uri": uri,
+                    "level": level,
+                    "abstract": "existing",
+                    "search_tags": ["team-a", "project-x"],
+                }
+            ]
+
+        async def enqueue_embedding_msg(self, msg):
+            captured["msg"] = msg
+            return True
+
+    fake_service = type("Svc", (), {"vikingdb_manager": FakeVikingDB()})()
+    monkeypatch.setattr("openviking.service.reindex_executor.get_service", lambda: fake_service)
+
+    class _FakeMsg:
+        def __init__(self):
+            self.telemetry_id = ""
+            self.id = "msg-1"
+
+    def fake_from_context(context):
+        captured["meta"] = dict(context.meta or {})
+        return _FakeMsg()
+
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.EmbeddingMsgConverter.from_context",
+        fake_from_context,
+    )
+
+    service = ReindexExecutor()
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="alice"),
+        role=Role.ROOT,
+    )
+
+    await service._upsert_context(
+        uri="viking://resources/demo.txt",
+        parent_uri="viking://resources",
+        abstract="new abstract",
+        vector_text="new vector text",
+        is_leaf=True,
+        context_type="resource",
+        level=ContextLevel.DETAIL,
+        ctx=ctx,
+    )
+
+    assert captured["meta"]["search_tags"] == ["team-a", "project-x"]
 
 
 @pytest.mark.asyncio
@@ -1178,8 +1249,11 @@ async def test_reindex_user_namespace_partitions_memory_skill_and_resource(monke
                 {"uri": "viking://user/default/memories/preferences", "isDir": True},
                 {"uri": "viking://user/default/skills", "isDir": True},
                 {"uri": "viking://user/default/skills/my_skill", "isDir": True},
+                {"uri": "viking://user/default/sessions", "isDir": True},
+                {"uri": "viking://user/default/sessions/s1", "isDir": True},
                 {"uri": "viking://user/default/resources", "isDir": True},
                 {"uri": "viking://user/default/resources/doc.md", "isDir": False},
+                {"uri": "viking://user/default/sessions/s1/messages.jsonl", "isDir": False},
                 {"uri": "viking://user/default/profile.md", "isDir": False},
                 {"uri": "viking://user/default/memories/preferences/theme.md", "isDir": False},
                 {"uri": "viking://user/default/skills/my_skill/SKILL.md", "isDir": False},
@@ -1232,6 +1306,7 @@ async def test_reindex_user_namespace_partitions_memory_skill_and_resource(monke
     assert "viking://user/default/resources" in seen["resource_dirs"]
     assert "viking://user/default/memories" not in seen["resource_dirs"]
     assert "viking://user/default/skills" not in seen["resource_dirs"]
+    assert "viking://user/default/sessions" not in seen["resource_dirs"]
     assert seen["resource_files"] == [
         "viking://user/default/resources/doc.md",
         "viking://user/default/profile.md",

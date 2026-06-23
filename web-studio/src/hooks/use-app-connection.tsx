@@ -138,6 +138,18 @@ function resolveIdentityField(
   return storedValue || defaultValue
 }
 
+export function resolveInitialApiKey({
+  defaultApiKey,
+  envApiKey,
+  storedApiKey,
+}: {
+  defaultApiKey: string
+  envApiKey: string
+  storedApiKey: string | undefined
+}): string {
+  return envApiKey || storedApiKey || defaultApiKey
+}
+
 function applyConnection(
   connection: ConnectionDraft,
   serverMode: ServerMode,
@@ -158,7 +170,7 @@ async function detectConnectionRole(
   connection: ConnectionDraft,
 ): Promise<ConnectionRole> {
   const headers: Record<string, string> = {}
-  const apiKey = connection.apiKey || connection.adminApiKey
+  const apiKey = connection.adminApiKey || connection.apiKey
   if (apiKey) {
     headers['X-API-Key'] = apiKey
   }
@@ -180,11 +192,11 @@ function readInitialConnection(): ConnectionDraft {
     ENV_ADMIN_API_KEY ||
     storedConnection.adminApiKey ||
     DEFAULT_CONNECTION.adminApiKey
-  const apiKey =
-    ENV_API_KEY ||
-    ovClient.getConnection().apiKey ||
-    storedConnection.apiKey ||
-    DEFAULT_CONNECTION.apiKey
+  const apiKey = resolveInitialApiKey({
+    defaultApiKey: DEFAULT_CONNECTION.apiKey,
+    envApiKey: ENV_API_KEY,
+    storedApiKey: storedConnection.apiKey,
+  })
   return normalizeConnectionDraft({
     ...DEFAULT_CONNECTION,
     ...storedConnection,
@@ -259,8 +271,14 @@ export function AppConnectionProvider({
   )
   const [connectionRole, setConnectionRole] =
     React.useState<ConnectionRole>('unknown')
-  const [isConnectionRoleLoading, setConnectionRoleLoading] =
-    React.useState(false)
+  const [isConnectionRoleLoading, setConnectionRoleLoading] = React.useState(
+    () =>
+      Boolean(
+        initialConnectionRef.current?.baseUrl &&
+        (initialConnectionRef.current.adminApiKey ||
+          initialConnectionRef.current.apiKey),
+      ),
+  )
   const [serverMode, setServerMode] = React.useState<ServerMode>('checking')
 
   const openConnectionSettings = React.useCallback(() => {
@@ -292,7 +310,7 @@ export function AppConnectionProvider({
 
   React.useEffect(() => {
     let cancelled = false
-    const apiKey = connection.apiKey || connection.adminApiKey
+    const apiKey = connection.adminApiKey || connection.apiKey
 
     setConnectionRole('unknown')
     setConnectionRoleLoading(Boolean(connection.baseUrl && apiKey))
